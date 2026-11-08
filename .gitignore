@@ -1,0 +1,16 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Lecture audio (YouTube source, keep local only)
+data/audio/
+
+# Derived index (regenerate with embedding.py)
+data/index/

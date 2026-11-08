@@ -1,0 +1,12 @@
+[project]
+name = "rag"
+version = "0.1.0"
+description = "Lecture RAG: ask questions to lecture audio (Whisper + embeddings + BM25 + local LLM), built from scratch"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mlx-whisper>=0.4.3",
+    "numpy>=2.5.4",
+    "requests>=2.34.2",
+    "sentence-transformers>=6.2.0",
+]
