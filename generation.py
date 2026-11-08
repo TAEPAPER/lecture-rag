@@ -47,8 +47,8 @@ def build_prompt(question: str, results: list[tuple[float, dict]]) -> str:
     return "[강의 발췌]\n\n" + "\n\n".join(blocks) + f"\n\n[질문]\n{question}"
 
 
-def generate(prompt: str, verbose: bool = True, model: str = LLM_MODEL) -> str:
-    """Call Ollama with streaming: print tokens as they arrive (if verbose), return the full answer."""
+def stream_answer(prompt: str, model: str = LLM_MODEL):
+    """Yield answer tokens (str) as Ollama produces them, then one final dict with Ollama's timing stats."""
     payload = {
         "model": model,
         "messages": [
@@ -61,17 +61,26 @@ def generate(prompt: str, verbose: bool = True, model: str = LLM_MODEL) -> str:
             "num_ctx": 8192,     # context window in tokens; Ollama's default is small
         },
     }
-    answer = []
     with requests.post(OLLAMA_URL, json=payload, stream=True, timeout=300) as r:
         r.raise_for_status()
         for line in r.iter_lines():  # one JSON object per line (NDJSON)
             msg = json.loads(line)
             token = msg.get("message", {}).get("content", "")
-            if verbose:
-                print(token, end="", flush=True)
-            answer.append(token)
+            if token:
+                yield token
             if msg.get("done"):
-                break
+                yield msg  # final message carries prompt_eval_count, eval_duration, ...
+                return
+
+
+def generate(prompt: str, verbose: bool = True, model: str = LLM_MODEL) -> str:
+    """Return the full answer; print tokens as they arrive if verbose."""
+    answer = []
+    for item in stream_answer(prompt, model=model):
+        if isinstance(item, str):
+            if verbose:
+                print(item, end="", flush=True)
+            answer.append(item)
     if verbose:
         print()
     return "".join(answer)

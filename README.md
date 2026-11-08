@@ -19,6 +19,7 @@ sources:
 | 임베딩 | `BAAI/bge-m3`, 정규화 → 코사인 = 내적 | `embedding.py` |
 | 검색 | numpy 내적(뜻) + 직접 구현한 BM25(키워드, 한국어 글자 bigram)를 RRF로 결합, top-5 | `retrieval.py` `bm25.py` `hybrid.py` |
 | 생성 | Ollama `exaone3.5:7.8b`, 발췌 밖 지식 사용 금지 프롬프트(v2), 스트리밍 | `generation.py` |
+| 서빙 | FastAPI, SSE로 근거 시간 먼저 → 답변 토큰 스트리밍, 간단한 웹 페이지 | `server.py` |
 | 평가 | 검색: Recall@k, MRR / 생성: 정답 키워드, 거절 여부 | `eval_retrieval.py` `eval_generation.py` |
 
 ## 평가셋
@@ -64,6 +65,9 @@ uv run mlx_whisper data/audio/ch03_mlp_backprop.m4a --model mlx-community/whispe
 # 2) 인덱스 생성 → 3) 질문
 uv run python embedding.py
 uv run python generation.py "하이퍼탄젠트를 쓰면 레이블을 어떻게 바꿔야 해?"
+
+# 웹으로 질문 (답변이 한 글자씩 스트리밍됨) → http://localhost:8000
+uv run uvicorn server:app --port 8000
 
 # 평가
 uv run python eval_retrieval.py

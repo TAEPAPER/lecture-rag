@@ -5,8 +5,10 @@ description = "Lecture RAG: ask questions to lecture audio (Whisper + embeddings
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "fastapi>=0.162.2",
     "mlx-whisper>=0.4.3",
     "numpy>=2.5.4",
     "requests>=2.34.2",
     "sentence-transformers>=6.2.0",
+    "uvicorn>=0.54.0",
 ]
