@@ -51,6 +51,8 @@ def main(think: bool = False, out_path: str = OUT_PATH):
             "fake_cite_caught": a.last_fake_cites,  # made-up times the guard caught (then asked to re-answer)
             "fake_cite_final": agent_module.fake_citations(answer, a.messages),  # made-up times left in the final answer
             "seconds": round(time.time() - t0, 1),
+            # everything the tools returned = what the agent SAW (judge.py checks the answer against it)
+            "context": "\n\n".join(m["content"] for m in tool_msgs),
         }
         if row["answerable"]:
             row["found"] = any(gold_overlaps(m["content"], q["start"], q["end"]) for m in tool_msgs)
