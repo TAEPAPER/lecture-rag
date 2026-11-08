@@ -19,8 +19,12 @@ Run:  uv run python agent.py          (chat in the terminal; type q to quit)
 """
 
 import json
+import os
 import random
+import re
 import sys
+import time
+from pathlib import Path
 
 import requests
 
@@ -28,9 +32,72 @@ from chunking import fmt_time
 from hybrid import HybridRetriever
 from retrieval import Retriever
 
+
+def load_env(path: str = ".env"):
+    """Read KEY=VALUE lines from .env into os.environ (the API key lives there, never in code or git)."""
+    if Path(path).exists():
+        for line in Path(path).read_text().splitlines():
+            if "=" in line and not line.strip().startswith("#"):
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip())
+
+
+load_env()
+
+# Which LLM runs the agent. Only call_llm() knows the difference; the agent loop is the same.
+#   ollama:     local, free, slow on a laptop (~55-90 s per question)
+#   openrouter: cloud gateway to many models with one key (OPENROUTER_API_KEY in .env), OpenAI-compatible
+#   groq:       cloud, very fast, fewer models, free tier (GROQ_API_KEY in .env), OpenAI-compatible
+#   gemini:     Google cloud, free tier (GEMINI_API_KEY in .env), OpenAI-compatible endpoint
+# Pick with env vars, e.g.  AGENT_BACKEND=openrouter AGENT_MODEL=qwen/qwen3-32b uv run python agent.py
+BACKEND = os.environ.get("AGENT_BACKEND", "ollama")
 OLLAMA_URL = "http://localhost:11434/api/chat"
-AGENT_MODEL = "qwen3:8b"  # supports tool calling in Ollama; EXAONE 3.5 does not
+CLOUD = {  # backend -> (chat completions URL, env var holding the API key)
+    "openrouter": ("https://openrouter.ai/api/v1/chat/completions", "OPENROUTER_API_KEY"),
+    "groq": ("https://api.groq.com/openai/v1/chat/completions", "GROQ_API_KEY"),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "GEMINI_API_KEY"),
+}
+DEFAULT_MODEL = {
+    "ollama": "qwen3:8b",           # supports tool calling in Ollama; EXAONE 3.5 does not
+    "openrouter": "qwen/qwen3-32b",  # same family as the local model, 4x larger (no 8B with tools there)
+    "groq": "openai/gpt-oss-120b",
+    "gemini": "gemini-3.6-flash",    # Google AI Studio free tier (limits shown per project in AI Studio)
+}
+AGENT_MODEL = os.environ.get("AGENT_MODEL") or DEFAULT_MODEL[BACKEND]
 MAX_STEPS = 6             # safety limit per user message: stop even if the LLM keeps calling tools
+SEARCH_K = 5              # chunks per search (was 3; plain RAG uses 5 and found more gold sections)
+REFUSAL = "다루지 않은"
+# Sent when the LLM refuses without having searched (eval_agent.py: 7/41 questions did this).
+NUDGE = "(시스템 알림) 아직 search_lecture로 강의를 찾아보지 않았습니다. 먼저 검색해 보고, 검색 결과를 본 뒤에 답하세요."
+# Sent when the answer cites a lecture time that no tool result contained (a made-up source).
+# eval_agent.py: gpt-oss-120b answered off-lecture questions from its own knowledge and added fake times like 27:15~27:42.
+FAKE_CITE = ("(시스템 알림) 답변에 적은 강의 시간 {times}은(는) 검색 결과에 없습니다. "
+             "검색 결과에 있는 내용과 시간만으로 다시 답하세요. 검색 결과에 답이 없으면 \"강의에서 다루지 않은 내용입니다.\"라고만 답하세요.")
+TIME_RE = re.compile(r"(\d{1,2}):(\d{2})")
+RANGE_RE = re.compile(r"\((\d{1,2}:\d{2})~(\d{1,2}:\d{2})\)")  # how tool results label each section
+CITE_SLACK = 5  # seconds: allow a cited time a little outside a section (rounding)
+
+
+def to_seconds(mm_ss: str) -> int:
+    m, s = mm_ss.split(":")
+    return int(m) * 60 + int(s)
+
+
+def fake_citations(answer: str, messages: list[dict]) -> list[str]:
+    """Times written in the answer that fall inside NO section the tools actually returned.
+
+    This is a check in code, not a request to the LLM: we don't trust the model to be honest about its sources,
+    we compare its claims against what it was really given (like validating a client's input on the server).
+    """
+    sections = [(to_seconds(a), to_seconds(b))
+                for m in messages if m["role"] == "tool"
+                for a, b in RANGE_RE.findall(m["content"])]
+    fakes = []
+    for m, s in TIME_RE.findall(answer):
+        t = int(m) * 60 + int(s)
+        if not any(a - CITE_SLACK <= t <= b + CITE_SLACK for a, b in sections):
+            fakes.append(f"{m}:{s}")
+    return fakes
 
 SYSTEM_PROMPT = """너는 대학 강의(오일석 「기계학습」 3장 3.4~3.7절)로 공부하는 학생을 돕는 조교다.
 학생의 메시지를 보고 아래 세 가지 중 맞는 일을 한다.
@@ -66,7 +133,7 @@ def get_retriever() -> HybridRetriever:
 
 def search_lecture(query: str) -> str:
     """Tool: search the lecture transcript, return the top 3 chunks with timestamps."""
-    results = get_retriever().search(query, k=3)
+    results = get_retriever().search(query, k=SEARCH_K)
     return "\n\n".join(f"({fmt_time(c['start'])}~{fmt_time(c['end'])}) {c['text']}" for _, c in results)
 
 
@@ -91,7 +158,7 @@ TOOL_SPECS = [
         "type": "function",
         "function": {
             "name": "search_lecture",
-            "description": "강의 전사본에서 query와 관련된 구간 3개를 찾아 시간과 함께 돌려준다. 질문에 답할 때 쓴다.",
+            "description": "강의 전사본에서 query와 관련된 구간 5개를 찾아 시간과 함께 돌려준다. 질문에 답할 때 쓴다.",
             "parameters": {
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": "검색할 내용. 짧은 키워드나 문장"}},
@@ -115,13 +182,17 @@ TOOL_SPECS = [
 
 # ---------------------------------------------------------------- agent
 
-def call_llm(messages: list[dict]) -> dict:
+def call_llm(messages: list[dict], think: bool = False) -> dict:
+    return call_cloud(messages, think) if BACKEND in CLOUD else call_ollama(messages, think)
+
+
+def call_ollama(messages: list[dict], think: bool = False) -> dict:
     payload = {
         "model": AGENT_MODEL,
         "messages": messages,
         "tools": TOOL_SPECS,
         "stream": False,
-        "think": False,  # Qwen 3 can "think out loud" first; off to keep it fast and the trace readable
+        "think": think,  # Qwen 3 can reason privately before acting: more careful, but slower
         "options": {"temperature": 0.1, "num_ctx": 8192},
     }
     r = requests.post(OLLAMA_URL, json=payload, timeout=300)
@@ -129,25 +200,96 @@ def call_llm(messages: list[dict]) -> dict:
     return r.json()["message"]
 
 
+def call_cloud(messages: list[dict], think: bool = False) -> dict:
+    """Same job as call_ollama, but over the OpenAI-style API that most cloud LLMs share.
+
+    We keep the conversation in Ollama's shape and translate at the edge (like a DTO mapper):
+      - tool call arguments: Ollama uses a dict, OpenAI a JSON string
+      - tool results: OpenAI links each result to its call by tool_call_id
+    """
+    def to_openai(m: dict) -> dict:
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            return {"role": "assistant", "content": m.get("content") or "", "tool_calls": [
+                {"id": c["id"], "type": "function",
+                 "function": {"name": c["function"]["name"], "arguments": json.dumps(c["function"]["arguments"], ensure_ascii=False)},
+                 **({"extra_content": c["extra_content"]} if "extra_content" in c else {})}
+                for c in m["tool_calls"]]}
+        if m["role"] == "tool":
+            return {"role": "tool", "tool_call_id": m["tool_call_id"], "content": m["content"]}
+        return {"role": m["role"], "content": m["content"]}
+
+    payload = {
+        "model": AGENT_MODEL,
+        "messages": [to_openai(m) for m in messages],
+        "tools": TOOL_SPECS,  # same tool list: Ollama copied OpenAI's format
+        "temperature": 0.1,
+    }
+    if BACKEND == "openrouter":
+        payload["reasoning"] = {"enabled": think}  # OpenRouter's common switch for thinking models (Qwen3 etc.)
+    else:
+        payload["reasoning_effort"] = "medium" if think else "low"  # gpt-oss on Groq always reasons a little
+    url, key_name = CLOUD[BACKEND]
+    headers = {"Authorization": f"Bearer {os.environ[key_name]}"}
+    # 429 = rate limit. Free tiers allow only a few requests per minute (Gemini free: ~8/min here),
+    # so wait in 15 s steps for up to ~2 minutes before giving up.
+    for attempt in range(8):
+        r = requests.post(url, json=payload, headers=headers, timeout=120)
+        if r.status_code != 429:
+            break
+        time.sleep(float(r.headers.get("retry-after", 15)))
+    r.raise_for_status()
+    m = r.json()["choices"][0]["message"]
+    msg = {"role": "assistant", "content": m.get("content") or ""}
+    if m.get("tool_calls"):
+        # Gemini attaches extra_content.google.thought_signature (its private reasoning, encrypted) to each call
+        # and rejects the next request (400) unless we send it back unchanged. Other providers don't send it.
+        msg["tool_calls"] = [{"id": c["id"], "function": {"name": c["function"]["name"],
+                                                         "arguments": json.loads(c["function"]["arguments"] or "{}")},
+                              **({"extra_content": c["extra_content"]} if "extra_content" in c else {})}
+                             for c in m["tool_calls"]]
+    return msg
+
+
 class Agent:
-    def __init__(self, verbose: bool = True):
+    def __init__(self, verbose: bool = True, think: bool = False):
         # The conversation IS the agent's memory: every turn, tool call and tool result is kept here
         # and sent to the LLM again on the next turn.
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.verbose = verbose
+        self.think = think
 
     def reply(self, user_text: str) -> str:
         self.messages.append({"role": "user", "content": user_text})
+        searched, nudged, cite_checked = False, False, False
+        self.last_fake_cites = []  # what the citation check caught this turn (for eval_agent.py)
         for step in range(1, MAX_STEPS + 1):
-            msg = call_llm(self.messages)
+            msg = call_llm(self.messages, think=self.think)
+            msg.pop("thinking", None)  # keep the private reasoning out of the stored conversation
             self.messages.append(msg)
 
             tool_calls = msg.get("tool_calls") or []
-            if not tool_calls:  # a normal message: this turn is done
+            if not tool_calls:  # a normal message
+                # Guard: refusing without looking is a known failure. Push back once, then accept.
+                if REFUSAL in msg["content"] and not searched and not nudged:
+                    if self.verbose:
+                        print(f"  [step {step}] 검색 없이 거절 → 먼저 검색하라고 다시 시킴")
+                    self.messages.append({"role": "user", "content": NUDGE})
+                    nudged = True
+                    continue
+                # Guard 2: every lecture time in the answer must come from a tool result. Push back once.
+                fakes = fake_citations(msg["content"], self.messages)
+                if fakes and not cite_checked:
+                    if self.verbose:
+                        print(f"  [step {step}] 검색 결과에 없는 시간 {fakes} → 다시 답하라고 시킴")
+                    self.last_fake_cites = fakes
+                    self.messages.append({"role": "user", "content": FAKE_CITE.format(times=", ".join(fakes))})
+                    cite_checked = True
+                    continue
                 return msg["content"]
 
             for call in tool_calls:
                 name = call["function"]["name"]
+                searched = searched or name == "search_lecture"
                 args = call["function"].get("arguments") or {}  # already a dict in Ollama's response
                 if self.verbose:
                     print(f"  [step {step}] 도구 호출: {name}({json.dumps(args, ensure_ascii=False)})")
@@ -159,7 +301,7 @@ class Agent:
                     result = f"error: {type(e).__name__}: {e}"
                 if self.verbose:
                     print(f"           결과: {result[:70].replace(chr(10), ' ')}...")
-                self.messages.append({"role": "tool", "tool_name": name, "content": result})
+                self.messages.append({"role": "tool", "tool_name": name, "tool_call_id": call.get("id"), "content": result})
 
         return "(멈춤: 도구 호출이 너무 많습니다)"
 
