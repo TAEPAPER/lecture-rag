@@ -18,7 +18,7 @@ import agent as agent_module
 from eval_generation import REFUSAL
 from eval_retrieval import EVAL_PATH
 
-OUT_PATH = "data/eval/agent_results_v1.json"
+OUT_PATH = "data/eval/agent_results_latest.json"  # pass --out to keep a named run
 TIME_RE = re.compile(r"\d{1,2}:\d{2}")
 
 
