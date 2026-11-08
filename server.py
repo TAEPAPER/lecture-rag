@@ -13,6 +13,7 @@ wait, but the user sees the sources immediately and the answer from its first to
 """
 
 import json
+import threading
 import time
 from contextlib import asynccontextmanager
 
@@ -26,6 +27,13 @@ from hybrid import HybridRetriever
 from retrieval import Retriever
 
 state = {}
+
+# Ollama answers one request at a time on this laptop (exp_concurrency.py: 3 users -> ~11s, ~24s, ~36s).
+# We make that queue explicit so we can tell each user how many people are ahead of them.
+# Like a connection pool of size 1: the lock is the single LLM "connection", `in_line` counts holders + waiters.
+llm_lock = threading.Lock()
+queue_lock = threading.Lock()
+queue = {"in_line": 0}
 
 
 @asynccontextmanager
@@ -65,14 +73,24 @@ def ask(req: AskRequest):
                 {"n": i, "start": fmt_time(c["start"]), "end": fmt_time(c["end"])}
                 for i, (_, c) in enumerate(results, 1)
             ])
-            first_token, stats = None, {}
-            for item in stream_answer(build_prompt(req.question, results)):
-                if isinstance(item, str):
-                    if first_token is None:
-                        first_token = time.perf_counter() - t0
-                    yield sse("token", item)
-                else:
-                    stats = item
+            with queue_lock:
+                ahead = queue["in_line"]  # people using or waiting for the LLM before me
+                queue["in_line"] += 1
+            try:
+                if ahead:
+                    yield sse("queued", {"ahead": ahead})
+                first_token, stats = None, {}
+                with llm_lock:  # wait for my turn; released even if the browser disconnects
+                    for item in stream_answer(build_prompt(req.question, results)):
+                        if isinstance(item, str):
+                            if first_token is None:
+                                first_token = time.perf_counter() - t0
+                            yield sse("token", item)
+                        else:
+                            stats = item
+            finally:
+                with queue_lock:
+                    queue["in_line"] -= 1
             yield sse("done", {
                 "search_s": round(t_search, 3),
                 "first_token_s": round(first_token or 0, 2),
@@ -112,11 +130,15 @@ PAGE = """<!doctype html>
   <div id="timing" class="muted"></div>
 <script>
 const $ = id => document.getElementById(id);
+// LLM output is untrusted text: escape HTML first, then turn **bold** into <strong>.
+const escapeHtml = s => s.replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const render = md => escapeHtml(md).replace(/\\*\\*(.+?)\\*\\*/g, "<strong>$1</strong>");
+let answerText = "";
 $("f").onsubmit = async (e) => {
   e.preventDefault();
   const question = $("q").value.trim();
   if (!question) return;
-  $("answer").textContent = ""; $("sources").textContent = ""; $("timing").textContent = "";
+  answerText = ""; $("answer").innerHTML = ""; $("sources").textContent = ""; $("timing").textContent = "";
   $("status").textContent = "검색 중...";
   const t0 = performance.now();
   const res = await fetch("/ask", {method: "POST", headers: {"Content-Type": "application/json"},
@@ -135,9 +157,12 @@ $("f").onsubmit = async (e) => {
       if (event === "sources") {
         $("status").textContent = "강의 조각을 찾았어요. LLM이 읽는 중...";
         $("sources").textContent = "근거 후보: " + data.map(s => `[${s.n}] ${s.start}~${s.end}`).join("  ");
+      } else if (event === "queued") {
+        $("status").textContent = `다른 질문을 처리하는 중이에요. 앞에 ${data.ahead}명 대기 중...`;
       } else if (event === "token") {
-        if (!$("answer").textContent) $("status").textContent = `첫 글자까지 ${((performance.now()-t0)/1000).toFixed(1)}초`;
-        $("answer").textContent += data;
+        if (!answerText) $("status").textContent = `첫 글자까지 ${((performance.now()-t0)/1000).toFixed(1)}초`;
+        answerText += data;
+        $("answer").innerHTML = render(answerText);  // re-render the whole text: a ** pair may span tokens
       } else if (event === "done") {
         $("timing").textContent = `검색 ${data.search_s}s · 첫 글자 ${data.first_token_s}s · 전체 ${data.total_s}s`;
       } else if (event === "error") {
