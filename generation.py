@@ -47,10 +47,10 @@ def build_prompt(question: str, results: list[tuple[float, dict]]) -> str:
     return "[강의 발췌]\n\n" + "\n\n".join(blocks) + f"\n\n[질문]\n{question}"
 
 
-def generate(prompt: str, verbose: bool = True) -> str:
+def generate(prompt: str, verbose: bool = True, model: str = LLM_MODEL) -> str:
     """Call Ollama with streaming: print tokens as they arrive (if verbose), return the full answer."""
     payload = {
-        "model": LLM_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},

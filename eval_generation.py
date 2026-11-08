@@ -23,7 +23,7 @@ import time
 from chunking import chunk_segments
 from embedding import embed, load_model
 from eval_retrieval import EVAL_PATH, first_hit_rank
-from generation import build_prompt, generate
+from generation import LLM_MODEL, build_prompt, generate
 from hybrid import HybridRetriever
 from retrieval import Retriever
 
@@ -45,7 +45,7 @@ def build_retriever(transcript=None):
     return HybridRetriever(Retriever(chunks=chunks, vectors=vectors, model=model))
 
 
-def main(only_ids=None, transcript=None, out_path=OUT_PATH):
+def main(only_ids=None, transcript=None, out_path=OUT_PATH, k=K, model=LLM_MODEL):
     questions = json.load(open(EVAL_PATH))
     if only_ids:  # quick check on a few questions; full runs take ~20 min
         questions = [q for q in questions if q["id"] in only_ids]
@@ -53,9 +53,9 @@ def main(only_ids=None, transcript=None, out_path=OUT_PATH):
     rows = []
 
     for i, q in enumerate(questions, 1):
-        results = retriever.search(q["question"], k=K)
+        results = retriever.search(q["question"], k=k)
         t0 = time.time()
-        answer = generate(build_prompt(q["question"], results), verbose=False)
+        answer = generate(build_prompt(q["question"], results), verbose=False, model=model)
         row = {
             "id": q["id"],
             "question": q["question"],
@@ -110,7 +110,10 @@ if __name__ == "__main__":
     # usage: python eval_generation.py                     (all 41, saved index)
     #        python eval_generation.py 14 104            (only these ids)
     #        python eval_generation.py --transcript PATH --out PATH
+    #        python eval_generation.py --k 3 --model exaone3.5:2.4b --out PATH
     args = sys.argv[1:]
     opt = lambda flag: args[args.index(flag) + 1] if flag in args else None
     ids = [int(a) for a in args if a.isdigit()]
-    main(ids or None, transcript=opt("--transcript"), out_path=opt("--out") or OUT_PATH)
+    ids = [i for i in ids if str(i) != opt("--k")]  # "--k 3" is not a question id
+    main(ids or None, transcript=opt("--transcript"), out_path=opt("--out") or OUT_PATH,
+         k=int(opt("--k") or K), model=opt("--model") or LLM_MODEL)
