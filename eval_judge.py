@@ -5,10 +5,12 @@
 
 agent results carry their own "context" (what the tools returned).
 RAG results don't, but RAG's search is deterministic, so we simply search again with the same settings.
-Writes <input>_judged.json with a "judge" field per question.
+Writes <input>_judged.json with a "judge" field per question, after EVERY question.
+Run the same command again after a crash: already-graded questions are skipped.
 """
 
 import json
+import os
 import sys
 
 from chunking import fmt_time
@@ -28,7 +30,9 @@ def keyword_ok(r: dict) -> bool:
 
 def main(kind: str, path: str):
     questions = {q["id"]: q for q in json.load(open(EVAL_PATH))}
-    rows = json.load(open(path))
+    out_path = path.replace(".json", "_judged.json")
+    # Resume: if a previous run stopped halfway, keep what it already graded (saved after every item).
+    rows = json.load(open(out_path)) if os.path.exists(out_path) else json.load(open(path))
     retriever = None
     if kind == "rag":
         from hybrid import HybridRetriever
@@ -36,12 +40,13 @@ def main(kind: str, path: str):
         retriever = HybridRetriever(Retriever())
 
     for i, r in enumerate(rows, 1):
+        if "judge" in r:
+            continue  # graded in an earlier run
         q = questions[r["id"]]
         context = r["context"] if kind == "agent" else rag_context(q["question"], retriever)
         r["judge"] = judge(q["question"], r["answer"], gold_text(q["start"], q["end"]), context)
+        json.dump(rows, open(out_path, "w"), ensure_ascii=False, indent=2)  # save every item: a crash loses nothing
         print(f"[{i}/{len(rows)}] #{r['id']} {r['judge']['correct']} {r['judge']['grounded']}", flush=True)
-
-    json.dump(rows, open(path.replace(".json", "_judged.json"), "w"), ensure_ascii=False, indent=2)
 
     n = len(rows)
     print(f"\n{'':24}keyword   judge")

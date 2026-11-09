@@ -200,6 +200,31 @@ def call_ollama(messages: list[dict], think: bool = False) -> dict:
     return r.json()["message"]
 
 
+RETRYABLE = {429, 500, 502, 503, 504}  # 429 = rate limit, 5xx = server hiccup (both pass if we wait)
+
+
+def post_with_retry(url: str, payload: dict, headers: dict, tries: int = 8) -> requests.Response:
+    """POST to a cloud API, waiting and retrying on rate limits AND temporary server errors.
+
+    Free tiers allow only a few requests per minute, and Groq sometimes answers 503 for a moment.
+    One such hiccup used to crash a 40-minute grading run, so wait (retry-after, else 15 s) and try again.
+    """
+    r = None
+    for _ in range(tries):
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=120)
+        except (requests.ConnectionError, requests.Timeout):
+            time.sleep(15)
+            continue
+        if r.status_code not in RETRYABLE:
+            break
+        time.sleep(float(r.headers.get("retry-after", 15)))
+    if r is None:
+        raise ConnectionError(f"no response from {url} after {tries} tries")
+    r.raise_for_status()
+    return r
+
+
 def call_cloud(messages: list[dict], think: bool = False) -> dict:
     """Same job as call_ollama, but over the OpenAI-style API that most cloud LLMs share.
 
@@ -230,15 +255,7 @@ def call_cloud(messages: list[dict], think: bool = False) -> dict:
         payload["reasoning_effort"] = "medium" if think else "low"  # gpt-oss on Groq always reasons a little
     url, key_name = CLOUD[BACKEND]
     headers = {"Authorization": f"Bearer {os.environ[key_name]}"}
-    # 429 = rate limit. Free tiers allow only a few requests per minute (Gemini free: ~8/min here),
-    # so wait in 15 s steps for up to ~2 minutes before giving up.
-    for attempt in range(8):
-        r = requests.post(url, json=payload, headers=headers, timeout=120)
-        if r.status_code != 429:
-            break
-        time.sleep(float(r.headers.get("retry-after", 15)))
-    r.raise_for_status()
-    m = r.json()["choices"][0]["message"]
+    m = post_with_retry(url, payload, headers).json()["choices"][0]["message"]
     msg = {"role": "assistant", "content": m.get("content") or ""}
     if m.get("tool_calls"):
         # Gemini attaches extra_content.google.thought_signature (its private reasoning, encrypted) to each call

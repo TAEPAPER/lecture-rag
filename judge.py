@@ -17,8 +17,6 @@ Run:  uv run python judge.py        (the three known cases below)
 import json
 import os
 
-import requests
-
 import agent  # reuse .env loading and the cloud backend table
 
 JUDGE_BACKEND = "groq"
@@ -73,12 +71,7 @@ def judge(question: str, answer: str, gold: str, context: str) -> dict:
     if JUDGE_MODEL.startswith("openai/gpt-oss"):
         payload["reasoning_effort"] = "medium"  # let it think a bit: grading needs care, not speed
     headers = {"Authorization": f"Bearer {os.environ[key_name]}"}
-    for _ in range(8):  # same 429 handling as the agent
-        r = requests.post(url, json=payload, headers=headers, timeout=120)
-        if r.status_code != 429:
-            break
-        agent.time.sleep(float(r.headers.get("retry-after", 15)))
-    r.raise_for_status()
+    r = agent.post_with_retry(url, payload, headers)  # same retry on 429 / 5xx as the agent
     return json.loads(r.json()["choices"][0]["message"]["content"])
 
 
