@@ -99,13 +99,21 @@ def fake_citations(answer: str, messages: list[dict]) -> list[str]:
             fakes.append(f"{m}:{s}")
     return fakes
 
-SYSTEM_PROMPT = """너는 대학 강의(오일석 「기계학습」 3장 3.4~3.7절)로 공부하는 학생을 돕는 조교다.
+# v1 -> v2 (2026-11-10). Same model (gpt-oss-120b): RAG grounded 40/41, agent v1 only 27/41.
+# v1 had one weak line ("검색 결과에 있는 내용만으로"); v2 copies the RAG prompt's rules that worked:
+# "no own knowledge", an explicit ban list, a refusal example, and the transcription-typo note.
+SYSTEM_PROMPT = """너는 대학 강의(오일석 「기계학습」 3장 3.4~3.7절)로 공부하는 학생을 돕는 조교다. 너 자신의 지식은 쓰지 않는다.
 학생의 메시지를 보고 아래 세 가지 중 맞는 일을 한다.
 
 [질문에 답하기]
 - 반드시 search_lecture 도구로 강의 내용을 찾아본 뒤 답한다. 주제가 여러 개면 주제마다 따로 검색한다.
-- 검색 결과에 있는 내용만으로 답하고, 근거가 된 강의 시간(예: 21:00~22:24)을 적는다.
-- 찾을 수 없으면 "강의에서 다루지 않은 내용입니다."라고 답한다.
+- 검색 결과를 전부 읽고, 질문에 답하는 문장을 찾는다.
+- 찾았으면: 그 문장의 내용만으로 답하고, 근거가 된 강의 시간(예: 21:00~22:24)을 적는다.
+- 못 찾았으면: 정확히 "강의에서 다루지 않은 내용입니다." 한 문장만 쓰고 끝낸다.
+- 금지: "일반적으로", "보통은", "~일 것입니다" 같은 추측이나 일반 지식 덧붙이기 /
+  검색 결과에 없는 용어·사람 이름·알고리즘 이름·예시를 새로 꺼내기 / 답이 없다고 한 뒤 설명을 이어 가기.
+- 검색 결과는 음성 인식으로 받아 적은 것이라 오타가 있다 (예: '벡타'=벡터, '네이블'=레이블, '래루'=ReLU). 문맥으로 바로잡아 읽는다.
+- 예시 (검색 결과에 답이 없는 경우) 질문: 드롭아웃 비율은 보통 얼마로 해? → 답: 강의에서 다루지 않은 내용입니다.
 
 [퀴즈 내기] (학생이 퀴즈, 문제, 테스트를 요청할 때)
 - pick_quiz_section 도구로 강의 구간을 하나 받아, 그 구간의 내용만으로 짧은 서술형 문제를 딱 1개 낸다.
@@ -201,13 +209,16 @@ def call_ollama(messages: list[dict], think: bool = False) -> dict:
 
 
 RETRYABLE = {429, 500, 502, 503, 504}  # 429 = rate limit, 5xx = server hiccup (both pass if we wait)
+MAX_WAIT = 120  # seconds: never trust a long retry-after blindly (see below)
 
 
-def post_with_retry(url: str, payload: dict, headers: dict, tries: int = 8) -> requests.Response:
+def post_with_retry(url: str, payload: dict, headers: dict, tries: int = 30) -> requests.Response:
     """POST to a cloud API, waiting and retrying on rate limits AND temporary server errors.
 
     Free tiers allow only a few requests per minute, and Groq sometimes answers 503 for a moment.
     One such hiccup used to crash a 40-minute grading run, so wait (retry-after, else 15 s) and try again.
+    The wait is capped at MAX_WAIT: Groq once said "retry in 20 min" for its daily limit, the quota came back
+    earlier, and the run still slept ~3 hours. Short waits x more tries = notice early, still survive ~1 hour.
     """
     r = None
     for _ in range(tries):
@@ -218,7 +229,7 @@ def post_with_retry(url: str, payload: dict, headers: dict, tries: int = 8) -> r
             continue
         if r.status_code not in RETRYABLE:
             break
-        time.sleep(float(r.headers.get("retry-after", 15)))
+        time.sleep(min(float(r.headers.get("retry-after", 15)), MAX_WAIT))
     if r is None:
         raise ConnectionError(f"no response from {url} after {tries} tries")
     r.raise_for_status()

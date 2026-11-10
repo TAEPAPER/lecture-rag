@@ -4,6 +4,7 @@ Pipeline: question -> Retriever.search (top-k chunks) -> build prompt -> local L
 """
 
 import json
+import os
 import sys
 
 import requests
@@ -73,8 +74,29 @@ def stream_answer(prompt: str, model: str = LLM_MODEL):
                 return
 
 
-def generate(prompt: str, verbose: bool = True, model: str = LLM_MODEL) -> str:
+def generate_cloud(prompt: str, backend: str, model: str) -> str:
+    """Same prompt, but a cloud model (e.g. Groq gpt-oss-120b) instead of local Ollama. No streaming.
+
+    Settings match the agent's cloud call (temperature 0.1, reasoning_effort low, same retry),
+    so RAG vs agent on the same model differs ONLY in the architecture (2026-11-09 A/B).
+    """
+    import agent  # lazy: reuses .env loading, the CLOUD table and post_with_retry
+    url, key_name = agent.CLOUD[backend]
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}],
+        "temperature": 0.1,
+    }
+    if backend != "openrouter":
+        payload["reasoning_effort"] = "low"
+    r = agent.post_with_retry(url, payload, {"Authorization": f"Bearer {os.environ[key_name]}"})
+    return r.json()["choices"][0]["message"]["content"] or ""
+
+
+def generate(prompt: str, verbose: bool = True, model: str = LLM_MODEL, backend: str = "ollama") -> str:
     """Return the full answer; print tokens as they arrive if verbose."""
+    if backend != "ollama":
+        return generate_cloud(prompt, backend, model)
     answer = []
     for item in stream_answer(prompt, model=model):
         if isinstance(item, str):
